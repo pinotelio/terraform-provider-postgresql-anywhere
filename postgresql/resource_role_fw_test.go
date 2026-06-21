@@ -318,7 +318,7 @@ resource "postgresql_role" "switch_role" {
 				Config: configPasswordWO,
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckRoleFWCanLogin(t, "switch_role", "wopass"),
-					resource.TestCheckResourceAttr("postgresql_role.switch_role", "password", ""), // value cleared from state
+					resource.TestCheckNoResourceAttr("postgresql_role.switch_role", "password"), // value cleared from state
 				),
 			},
 			{
@@ -339,27 +339,27 @@ resource "postgresql_role" "switch_role" {
 }
 
 func TestAccRoleFW_WriteOnlyPassword_WithVersioning(t *testing.T) {
-	const roleName = "switch_role"
+	const roleName = "wo_version_role"
 
 	configWOv1 := `
-resource "postgresql_role" "switch_role" {
-  name                 = "switch_role"
+resource "postgresql_role" "wo_version_role" {
+  name                 = "wo_version_role"
   login                = true
   password_wo          = "wopass1"
   password_wo_version  = 1
 }`
 
 	configWOv1NewPass := `
-resource "postgresql_role" "switch_role" {
-  name                 = "switch_role"
+resource "postgresql_role" "wo_version_role" {
+  name                 = "wo_version_role"
   login                = true
   password_wo          = "wopass2"
   password_wo_version  = "1"
 }`
 
 	configWOv2 := `
-resource "postgresql_role" "switch_role" {
-  name                 = "switch_role"
+resource "postgresql_role" "wo_version_role" {
+  name                 = "wo_version_role"
   login                = true
   password_wo          = "wopass2"
   password_wo_version  = "2"
@@ -376,7 +376,7 @@ resource "postgresql_role" "switch_role" {
 			{
 				Config: configWOv1,
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("postgresql_role.switch_role", "password_wo_version", "1"),
+					resource.TestCheckResourceAttr("postgresql_role.wo_version_role", "password_wo_version", "1"),
 					testAccCheckRoleFWCanLogin(t, roleName, "wopass1"),
 				),
 			},
@@ -385,7 +385,7 @@ resource "postgresql_role" "switch_role" {
 				Config: configWOv1NewPass,
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckRoleFWCanLogin(t, roleName, "wopass1"),
-					resource.TestCheckResourceAttr("postgresql_role.switch_role", "password_wo_version", "1"),
+					resource.TestCheckResourceAttr("postgresql_role.wo_version_role", "password_wo_version", "1"),
 				),
 			},
 			{
@@ -393,7 +393,7 @@ resource "postgresql_role" "switch_role" {
 				Config: configWOv2,
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckRoleFWCanLogin(t, roleName, "wopass2"),
-					resource.TestCheckResourceAttr("postgresql_role.switch_role", "password_wo_version", "2"),
+					resource.TestCheckResourceAttr("postgresql_role.wo_version_role", "password_wo_version", "2"),
 				),
 			},
 		},
