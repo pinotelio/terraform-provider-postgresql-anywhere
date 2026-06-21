@@ -67,8 +67,11 @@ type SSMTunnelConfig struct {
 	LocalPort    int               // local port to listen on (0 => OS-chosen)
 }
 
-// SSMTunnel is a running tunnel: a local TCP listener that proxies each
-// connection over its own SSM port-forwarding session.
+// SSMTunnel is a running tunnel: a local TCP listener that multiplexes every
+// connection over a single shared SSM port-forwarding session using smux. The
+// session is established on first use and re-established only when it breaks, so
+// rapid open/close churn and concurrent connections no longer each spin up (and
+// corrupt) their own SSM session.
 type SSMTunnel struct {
 	cfg        SSMTunnelConfig
 	instanceID string
@@ -76,6 +79,11 @@ type SSMTunnel struct {
 	listener   net.Listener
 	localHost  string
 	localPort  int
+
+	sessMu    sync.Mutex
+	session   *smux.Session   // shared; nil until first use / after a failure
+	dc        *ssmDataChannel // data channel backing session
+	sessionID string
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -87,11 +95,14 @@ func (t *SSMTunnel) LocalHost() string { return t.localHost }
 // LocalPort returns the local port the tunnel listens on.
 func (t *SSMTunnel) LocalPort() int { return t.localPort }
 
-// Close shuts the listener down. In-flight sessions terminate on their own.
+// Close shuts the listener down and tears down the shared SSM session.
 func (t *SSMTunnel) Close() error {
 	var err error
 	t.closeOnce.Do(func() {
 		close(t.closed)
+		t.sessMu.Lock()
+		t.teardownLocked()
+		t.sessMu.Unlock()
 		if t.listener != nil {
 			err = t.listener.Close()
 		}
@@ -193,14 +204,58 @@ func (t *SSMTunnel) acceptLoop() {
 	}
 }
 
-// handleConn opens a dedicated SSM port-forwarding session for one local
-// connection and bridges the two until either side closes.
+// handleConn bridges one local connection to a fresh smux stream on the shared
+// SSM session, opening (or re-opening) that session as needed.
 func (t *SSMTunnel) handleConn(local net.Conn) {
 	defer func() { _ = local.Close() }()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	stream, err := t.openStream()
+	if err != nil {
+		log.Printf("[WARN] ssm tunnel: could not open stream: %v", err)
+		return
+	}
+	defer func() { _ = stream.Close() }()
 
+	done := make(chan struct{}, 2)
+	go func() { _, _ = io.Copy(stream, local); done <- struct{}{} }()
+	go func() { _, _ = io.Copy(local, stream); done <- struct{}{} }()
+	select {
+	case <-done:
+	case <-t.closed:
+	}
+}
+
+// openStream returns a new multiplexed stream on the shared SSM session. It
+// establishes the session on first use and re-establishes it if it has died, so
+// callers always get a working stream or an error. This is the "reuse one
+// session, reconnect only when broken" model.
+func (t *SSMTunnel) openStream() (*smux.Stream, error) {
+	t.sessMu.Lock()
+	defer t.sessMu.Unlock()
+
+	if t.session == nil || t.session.IsClosed() {
+		if err := t.establishLocked(); err != nil {
+			return nil, err
+		}
+	}
+	stream, err := t.session.OpenStream()
+	if err != nil {
+		// The session broke between the health check and OpenStream; rebuild once.
+		log.Printf("[INFO] ssm tunnel: session unusable (%v), re-establishing", err)
+		if err := t.establishLocked(); err != nil {
+			return nil, err
+		}
+		return t.session.OpenStream()
+	}
+	return stream, nil
+}
+
+// establishLocked starts a fresh SSM session, performs the data-channel
+// handshake, and layers an smux client over it. The caller holds sessMu.
+func (t *SSMTunnel) establishLocked() error {
+	t.teardownLocked()
+
+	ctx := context.Background()
 	out, err := t.ssmClient.StartSession(ctx, &ssm.StartSessionInput{
 		Target:       aws.String(t.instanceID),
 		DocumentName: aws.String("AWS-StartPortForwardingSessionToRemoteHost"),
@@ -210,47 +265,75 @@ func (t *SSMTunnel) handleConn(local net.Conn) {
 		},
 	})
 	if err != nil {
-		log.Printf("[ERROR] ssm tunnel: StartSession failed: %v", err)
-		return
+		return fmt.Errorf("StartSession: %w", err)
 	}
 	sessionID := aws.ToString(out.SessionId)
-	log.Printf("[DEBUG] ssm tunnel: started session %s", sessionID)
-
-	defer func() {
-		tctx, tcancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer tcancel()
-		if _, e := t.ssmClient.TerminateSession(tctx, &ssm.TerminateSessionInput{
-			SessionId: aws.String(sessionID),
-		}); e != nil {
-			log.Printf("[WARN] ssm tunnel: TerminateSession %s failed: %v", sessionID, e)
-		} else {
-			log.Printf("[DEBUG] ssm tunnel: terminated session %s", sessionID)
-		}
-	}()
 
 	ws, _, err := websocket.DefaultDialer.DialContext(ctx, aws.ToString(out.StreamUrl), nil)
 	if err != nil {
-		log.Printf("[ERROR] ssm tunnel: websocket dial failed: %v", err)
-		return
+		t.terminate(sessionID)
+		return fmt.Errorf("websocket dial: %w", err)
 	}
-	defer func() { _ = ws.Close() }()
 
 	pr, pw := io.Pipe()
-	defer func() { _ = pw.Close() }()
 	dc := &ssmDataChannel{
 		ws:            ws,
 		token:         aws.ToString(out.TokenValue),
-		local:         local,
 		handshakeDone: make(chan struct{}),
 		pr:            pr,
 		pw:            pw,
+		dead:          make(chan struct{}),
 	}
 	if err := dc.open(); err != nil {
-		log.Printf("[ERROR] ssm tunnel: open data channel: %v", err)
-		return
+		_ = dc.close()
+		t.terminate(sessionID)
+		return fmt.Errorf("open data channel: %w", err)
 	}
-	dc.run(ctx)
-	log.Printf("[DEBUG] ssm tunnel: session %s closed", sessionID)
+	if err := dc.start(); err != nil {
+		_ = dc.close()
+		t.terminate(sessionID)
+		return fmt.Errorf("handshake: %w", err)
+	}
+
+	session, err := smux.Client(&dataChannelRWC{dc: dc}, smux.DefaultConfig())
+	if err != nil {
+		_ = dc.close()
+		t.terminate(sessionID)
+		return fmt.Errorf("smux client: %w", err)
+	}
+
+	t.session = session
+	t.dc = dc
+	t.sessionID = sessionID
+	log.Printf("[INFO] ssm tunnel: established session %s (multiplexing connections)", sessionID)
+	return nil
+}
+
+// teardownLocked closes the current smux session, data channel, and SSM session.
+// The caller holds sessMu.
+func (t *SSMTunnel) teardownLocked() {
+	if t.session != nil {
+		_ = t.session.Close()
+		t.session = nil
+	}
+	if t.dc != nil {
+		_ = t.dc.close()
+		t.dc = nil
+	}
+	if t.sessionID != "" {
+		t.terminate(t.sessionID)
+		t.sessionID = ""
+	}
+}
+
+func (t *SSMTunnel) terminate(sessionID string) {
+	tctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if _, e := t.ssmClient.TerminateSession(tctx, &ssm.TerminateSessionInput{
+		SessionId: aws.String(sessionID),
+	}); e != nil {
+		log.Printf("[DEBUG] ssm tunnel: TerminateSession %s: %v", sessionID, e)
+	}
 }
 
 func loadSSMAWSConfig(ctx context.Context, region, profile, roleARN, accessKey, secretKey, sessionToken string) (aws.Config, error) {
@@ -455,14 +538,16 @@ func deserializeAgentMessage(buf []byte) (*agentMessage, error) {
 	return m, nil
 }
 
-// ssmDataChannel drives one WebSocket session: open -> handshake -> smux relay.
+// ssmDataChannel drives one WebSocket session: open -> handshake, then carries
+// smux frames for the shared session that multiplexes every connection.
 type ssmDataChannel struct {
 	ws    *websocket.Conn
 	token string
-	local net.Conn
 
 	writeMu sync.Mutex
-	seq     int64
+	seq     int64 // next outbound (client->agent) input_stream_data sequence
+
+	expectedSeq int64 // next expected inbound (agent->client) output_stream_data sequence
 
 	handshakeDone chan struct{}
 	handshakeOnce sync.Once
@@ -471,6 +556,10 @@ type ssmDataChannel struct {
 	// back by the smux session through pr.
 	pr *io.PipeReader
 	pw *io.PipeWriter
+
+	dead      chan struct{} // closed when readLoop exits
+	deadErr   error         // why readLoop exited (read after dead is closed)
+	closeOnce sync.Once
 }
 
 // dataChannelRWC adapts the SSM data channel to an io.ReadWriteCloser so an smux
@@ -488,7 +577,7 @@ func (c *dataChannelRWC) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func (c *dataChannelRWC) Close() error { return c.dc.pr.CloseWithError(io.EOF) }
+func (c *dataChannelRWC) Close() error { return c.dc.close() }
 
 type openDataChannelInput struct {
 	MessageSchemaVersion string `json:"MessageSchemaVersion"`
@@ -515,53 +604,46 @@ func (dc *ssmDataChannel) open() error {
 	return dc.ws.WriteMessage(websocket.TextMessage, b)
 }
 
-func (dc *ssmDataChannel) run(ctx context.Context) {
-	errc := make(chan error, 2)
-	go dc.readLoop(errc)
-
-	// Wait for the agent handshake before pumping local data. If the handshake
-	// never arrives we proceed anyway after a grace period (some document
-	// versions begin streaming immediately).
+// start launches the read loop and blocks until the SSM handshake completes,
+// the channel dies, or the handshake times out. After it returns, the read loop
+// keeps running and feeds smux frames to the shared session.
+func (dc *ssmDataChannel) start() error {
+	go dc.readLoop()
 	select {
 	case <-dc.handshakeDone:
-		log.Printf("[DEBUG] ssm tunnel: handshake complete")
+		return nil
+	case <-dc.dead:
+		if dc.deadErr != nil {
+			return dc.deadErr
+		}
+		return fmt.Errorf("data channel closed before handshake")
 	case <-time.After(30 * time.Second):
-		log.Printf("[WARN] ssm tunnel: handshake timed out, proceeding to stream")
-	case err := <-errc:
-		log.Printf("[DEBUG] ssm tunnel: channel ended before handshake: %v", err)
-		return
-	case <-ctx.Done():
-		return
+		return fmt.Errorf("handshake timed out")
 	}
-
-	// The agent serves the port-forwarding data plane over smux on top of the SSM
-	// data channel, so raw bytes are ignored. Layer an smux client over the
-	// channel, open a stream, and relay the local connection through it.
-	session, err := smux.Client(&dataChannelRWC{dc: dc}, smux.DefaultConfig())
-	if err != nil {
-		log.Printf("[ERROR] ssm tunnel: smux client: %v", err)
-		return
-	}
-	defer func() { _ = session.Close() }()
-
-	stream, err := session.OpenStream()
-	if err != nil {
-		log.Printf("[ERROR] ssm tunnel: smux open stream: %v", err)
-		return
-	}
-	defer func() { _ = stream.Close() }()
-	log.Printf("[DEBUG] ssm tunnel: smux stream %d open, relaying", stream.ID())
-
-	go func() { _, e := io.Copy(stream, dc.local); errc <- e }()
-	go func() { _, e := io.Copy(dc.local, stream); errc <- e }()
-	<-errc
 }
 
-func (dc *ssmDataChannel) readLoop(errc chan error) {
+// close shuts the data channel down, unblocking both the smux reader and the
+// read loop.
+func (dc *ssmDataChannel) close() error {
+	dc.closeOnce.Do(func() {
+		_ = dc.pw.Close()
+		_ = dc.ws.Close()
+	})
+	return nil
+}
+
+func (dc *ssmDataChannel) readLoop() {
+	var exitErr error
+	defer func() {
+		dc.deadErr = exitErr
+		_ = dc.pw.CloseWithError(exitErr) // unblock the smux reader
+		close(dc.dead)
+	}()
+
 	for {
 		_, data, err := dc.ws.ReadMessage()
 		if err != nil {
-			errc <- err
+			exitErr = err
 			return
 		}
 		msg, err := deserializeAgentMessage(data)
@@ -572,7 +654,17 @@ func (dc *ssmDataChannel) readLoop(errc chan error) {
 
 		switch msg.MessageType {
 		case smOutputStreamData:
+			// Always acknowledge so the agent stops retransmitting this message.
 			dc.sendAcknowledge(msg)
+			// Deduplicate by sequence number. Under load the agent retransmits
+			// messages whose acks were delayed; processing a retransmit twice would
+			// feed duplicate bytes into smux and corrupt the multiplexed streams
+			// (manifesting as TLS errors on the database connections). Process each
+			// sequence exactly once, in order.
+			if msg.SequenceNumber != dc.expectedSeq {
+				continue
+			}
+			dc.expectedSeq++
 			switch msg.PayloadType {
 			case smPayloadTypeHandshakeRequest:
 				dc.sendHandshakeResponse(msg.Payload)
@@ -580,7 +672,7 @@ func (dc *ssmDataChannel) readLoop(errc chan error) {
 				dc.handshakeOnce.Do(func() { close(dc.handshakeDone) })
 			case smPayloadTypeOutput:
 				if _, werr := dc.pw.Write(msg.Payload); werr != nil {
-					errc <- werr
+					exitErr = werr
 					return
 				}
 			case smPayloadTypeError:
@@ -590,7 +682,7 @@ func (dc *ssmDataChannel) readLoop(errc chan error) {
 			// Best-effort: we do not retransmit, so acks are informational.
 		case smChannelClosed:
 			log.Printf("[INFO] ssm tunnel: channel closed by agent")
-			errc <- io.EOF
+			exitErr = io.EOF
 			return
 		case smStartPublication, smPausePublication:
 			// Flow-control hints; ignored in this best-effort implementation.
