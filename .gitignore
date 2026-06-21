@@ -1,0 +1,7 @@
+./*.tfstate
+.terraform/
+.terraform.lock.hcl*
+*.log
+.*.swp
+tests/docker-compose.*.yml
+terraform-provider-postgresql
