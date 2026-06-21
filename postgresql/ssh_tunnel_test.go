@@ -45,7 +45,7 @@ func TestSSHTunnelEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureUp: %v", err)
 	}
-	defer cfg.Close()
+	defer func() { _ = cfg.Close() }()
 
 	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
 		localHost, localPort, os.Getenv("PGUSER"), os.Getenv("PGPASSWORD"), envOrPostgres("PGDATABASE"))
@@ -53,7 +53,7 @@ func TestSSHTunnelEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	var one int
 	if err := db.QueryRow("SELECT 1").Scan(&one); err != nil {
@@ -116,7 +116,7 @@ func serveTestSSHConn(c net.Conn, cfg *ssh.ServerConfig) {
 	if err != nil {
 		return
 	}
-	defer sconn.Close()
+	defer func() { _ = sconn.Close() }()
 	go ssh.DiscardRequests(reqs)
 
 	for nc := range chans {

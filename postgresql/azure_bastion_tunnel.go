@@ -144,7 +144,7 @@ func (cfg *AzureBastionTunnelConfig) bastionDNSName(ctx context.Context, cred *a
 	if err != nil {
 		return "", fmt.Errorf("azure_bastion: could not read bastion resource: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("azure_bastion: bastion GET returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
@@ -179,7 +179,7 @@ func (cfg *AzureBastionTunnelConfig) sessionToken(ctx context.Context, dnsName, 
 	if err != nil {
 		return "", fmt.Errorf("azure_bastion: could not get bastion session token: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("azure_bastion: token endpoint returned %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
@@ -198,7 +198,7 @@ func (cfg *AzureBastionTunnelConfig) sessionToken(ctx context.Context, dnsName, 
 
 // handleConn opens a bastion websocket for one client connection and relays raw bytes.
 func (cfg *AzureBastionTunnelConfig) handleConn(ctx context.Context, cred *azidentity.DefaultAzureCredential, dnsName string, local net.Conn, closed <-chan struct{}) {
-	defer local.Close()
+	defer func() { _ = local.Close() }()
 
 	aadToken, err := cfg.armToken(ctx, cred)
 	if err != nil {
@@ -217,14 +217,14 @@ func (cfg *AzureBastionTunnelConfig) handleConn(ctx context.Context, cred *azide
 		log.Printf("[WARN] azure_bastion tunnel: could not open websocket: %v", err)
 		return
 	}
-	defer ws.Close()
+	defer func() { _ = ws.Close() }()
 
 	var writeMu sync.Mutex
 	go func() {
 		for {
 			_, msg, err := ws.ReadMessage()
 			if err != nil {
-				local.Close()
+				_ = local.Close()
 				return
 			}
 			if _, err := local.Write(msg); err != nil {

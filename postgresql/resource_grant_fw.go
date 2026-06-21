@@ -581,7 +581,7 @@ GROUP BY pg_class.relname
 		diags.AddError("could not read privileges", err.Error())
 		return diags
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var objName string
@@ -671,7 +671,7 @@ ORDER BY col_privs.attname
 		diags.AddError("could not read column privileges", err.Error())
 		return diags
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	for rows.Next() {
 		var objName string

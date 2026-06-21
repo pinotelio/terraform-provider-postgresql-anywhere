@@ -62,7 +62,7 @@ func TestGCPIAPTunnelEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EnsureUp: %v", err)
 	}
-	defer cfg.Close()
+	defer func() { _ = cfg.Close() }()
 
 	dsn := fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
 		localHost, localPort, os.Getenv("PGUSER"), os.Getenv("PGPASSWORD"), envOrPostgres("PGDATABASE"))
@@ -70,7 +70,7 @@ func TestGCPIAPTunnelEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 
 	var one int
 	if err := db.QueryRow("SELECT 1").Scan(&one); err != nil {
@@ -89,7 +89,7 @@ func fakeIAPRelay(w http.ResponseWriter, r *http.Request, destHost string, destP
 	if err != nil {
 		return
 	}
-	defer ws.Close()
+	defer func() { _ = ws.Close() }()
 
 	// CONNECT_SUCCESS_SID
 	sid := []byte("sid")
@@ -105,7 +105,7 @@ func fakeIAPRelay(w http.ResponseWriter, r *http.Request, destHost string, destP
 	if err != nil {
 		return
 	}
-	defer dest.Close()
+	defer func() { _ = dest.Close() }()
 
 	// dest -> client (DATA frames)
 	go func() {

@@ -111,7 +111,7 @@ func (cfg *GCPIAPTunnelConfig) Close() error {
 
 // handleConn opens an IAP WebSocket for one client connection and relays bytes.
 func (cfg *GCPIAPTunnelConfig) handleConn(ctx context.Context, ts oauth2.TokenSource, iface string, local net.Conn, closed <-chan struct{}) {
-	defer local.Close()
+	defer func() { _ = local.Close() }()
 
 	tok, err := ts.Token()
 	if err != nil {
@@ -137,7 +137,7 @@ func (cfg *GCPIAPTunnelConfig) handleConn(ctx context.Context, ts oauth2.TokenSo
 		log.Printf("[WARN] gcp_iap tunnel: could not open IAP websocket: %v", err)
 		return
 	}
-	defer ws.Close()
+	defer func() { _ = ws.Close() }()
 
 	iapRelay(local, ws, closed)
 }
@@ -173,7 +173,7 @@ func iapRelay(local net.Conn, ws *websocket.Conn, closed <-chan struct{}) {
 		for {
 			_, msg, err := ws.ReadMessage()
 			if err != nil {
-				local.Close()
+				_ = local.Close()
 				return
 			}
 			for len(msg) >= 2 {

@@ -205,7 +205,7 @@ func (t *sshTunnel) acceptLoop() {
 }
 
 func (t *sshTunnel) handleConn(local net.Conn) {
-	defer local.Close()
+	defer func() { _ = local.Close() }()
 
 	remoteAddr := net.JoinHostPort(t.cfg.RemoteHost, strconv.Itoa(t.cfg.RemotePort))
 	remote, err := t.client.Dial("tcp", remoteAddr)
@@ -213,7 +213,7 @@ func (t *sshTunnel) handleConn(local net.Conn) {
 		log.Printf("[WARN] ssh tunnel: could not reach %s through bastion: %v", remoteAddr, err)
 		return
 	}
-	defer remote.Close()
+	defer func() { _ = remote.Close() }()
 
 	done := make(chan struct{}, 2)
 	go func() { _, _ = io.Copy(remote, local); done <- struct{}{} }()

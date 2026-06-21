@@ -195,7 +195,7 @@ func (t *SSMTunnel) acceptLoop() {
 // handleConn opens a dedicated SSM port-forwarding session for one local
 // connection and bridges the two until either side closes.
 func (t *SSMTunnel) handleConn(local net.Conn) {
-	defer local.Close()
+	defer func() { _ = local.Close() }()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -232,7 +232,7 @@ func (t *SSMTunnel) handleConn(local net.Conn) {
 		log.Printf("[ERROR] ssm tunnel: websocket dial failed: %v", err)
 		return
 	}
-	defer ws.Close()
+	defer func() { _ = ws.Close() }()
 
 	dc := &ssmDataChannel{
 		ws:            ws,
