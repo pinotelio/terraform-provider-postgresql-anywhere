@@ -1,16 +1,45 @@
 ---
 layout: "postgresql"
-page_title: "Provider: PostgreSQL"
+page_title: "Provider: PostgreSQL Anywhere"
 sidebar_current: "docs-postgresql-index"
 description: |-
-  A provider for PostgreSQL Server.
+  Manage PostgreSQL objects with Terraform against a database anywhere: directly
+  reachable, or private on AWS, Azure, GCP, or on-prem, reached through a
+  built-in, pure-Go transport.
 ---
 
-# PostgreSQL Provider
+# PostgreSQL Anywhere Provider
 
-The PostgreSQL provider gives the ability to deploy and configure resources in a PostgreSQL server.
+Manage PostgreSQL objects (databases, roles, grants, schemas, extensions, and
+more) with Terraform, against a database anywhere: directly reachable, or sitting
+in a private subnet on AWS, Azure, GCP, or on-prem. The provider opens the
+network path for you through a pluggable transport, so you do not have to
+pre-establish a tunnel yourself.
 
-Use the navigation to the left to read about the available resources.
+## Highlights
+
+- **Connect anywhere.** Public, or private behind AWS, Azure, GCP, or on-prem,
+  through a built-in transport (SSH bastion, AWS SSM, Azure Bastion, or GCP IAP).
+- **Embedded security.** Every transport is pure Go, with no `aws`, `az`,
+  `gcloud`, `session-manager-plugin`, or `ssh` binary to install or keep patched.
+  The provider runs as-is on locked-down managed runners such as Terraform Cloud,
+  Scalr, and Spacelift, without needing any prerequisites or privileged setup
+  steps.
+- **Keyless by default.** The AWS, Azure, and GCP transports authenticate through
+  each cloud's default credential chain, following the recommended practice of
+  short-lived, federated credentials via OIDC / workload-identity.
+
+## Connectivity (the "anywhere" part)
+
+Pick at most one transport block. With none, the provider connects directly.
+
+| Transport | Reaches | How |
+|---|---|---|
+| *(none)* | Any publicly reachable PostgreSQL | Direct connection. |
+| `ssh_bastion` | Any private PostgreSQL on AWS, Azure, GCP, or on-prem | Built-in SSH tunnel through a bastion you can reach, no CLI. One hop to the database. |
+| `aws_ssm` | Private AWS RDS | Built-in AWS SSM port-forwarding through a bastion EC2 instance, no CLI. Auth via the AWS default credential chain (OIDC-friendly). The bastion needs no public IP and no inbound port. |
+| `azure_bastion` | Private Azure PostgreSQL (via a jump VM) | Built-in Azure Bastion tunnel, no CLI. Auth via Azure AD (OIDC-friendly). Experimental. |
+| `gcp_iap` | Private GCP PostgreSQL (via a jump VM) | Built-in IAP TCP forwarding, no CLI. Auth via Google Application Default Credentials (OIDC-friendly). |
 
 ## Usage
 
