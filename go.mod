@@ -23,6 +23,7 @@ require (
 	github.com/lib/pq v1.12.3
 	github.com/sean-/postgresql-acl v0.0.0-20161225120419-d10489e5d217
 	github.com/stretchr/testify v1.11.1
+	github.com/xtaci/smux v1.5.57
 	gocloud.dev v0.45.0
 	golang.org/x/crypto v0.52.0
 	golang.org/x/net v0.55.0

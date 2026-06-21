@@ -48,6 +48,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/gorilla/websocket"
+	"github.com/xtaci/smux"
 )
 
 // SSMTunnelConfig holds the user-supplied inputs for the SSM tunnel.
@@ -234,11 +235,15 @@ func (t *SSMTunnel) handleConn(local net.Conn) {
 	}
 	defer func() { _ = ws.Close() }()
 
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
 	dc := &ssmDataChannel{
 		ws:            ws,
 		token:         aws.ToString(out.TokenValue),
 		local:         local,
 		handshakeDone: make(chan struct{}),
+		pr:            pr,
+		pw:            pw,
 	}
 	if err := dc.open(); err != nil {
 		log.Printf("[ERROR] ssm tunnel: open data channel: %v", err)
@@ -408,7 +413,12 @@ func (m *agentMessage) serialize() []byte {
 	binary.BigEndian.PutUint64(buf[smCreatedDateOffset:], m.CreatedDate)
 	binary.BigEndian.PutUint64(buf[smSequenceNumberOffset:], uint64(m.SequenceNumber))
 	binary.BigEndian.PutUint64(buf[smFlagsOffset:], m.Flags)
-	copy(buf[smMessageIDOffset:smMessageIDOffset+smMessageIDLength], m.MessageID[:])
+	// On the wire the MessageId is stored as [least-significant 8 bytes][most-
+	// significant 8 bytes], swapped relative to the standard UUID byte order we
+	// keep in memory. The agent matches ACKs by this id, so the halves must be
+	// swapped or it never sees our acknowledgements and retransmits forever.
+	copy(buf[smMessageIDOffset:smMessageIDOffset+8], m.MessageID[8:16])
+	copy(buf[smMessageIDOffset+8:smMessageIDOffset+16], m.MessageID[0:8])
 
 	digest := sha256.Sum256(m.Payload)
 	copy(buf[smPayloadDigestOffset:smPayloadDigestOffset+smPayloadDigestLength], digest[:])
@@ -431,7 +441,10 @@ func deserializeAgentMessage(buf []byte) (*agentMessage, error) {
 		Flags:          binary.BigEndian.Uint64(buf[smFlagsOffset:]),
 		PayloadType:    binary.BigEndian.Uint32(buf[smPayloadTypeOffset:]),
 	}
-	copy(m.MessageID[:], buf[smMessageIDOffset:smMessageIDOffset+smMessageIDLength])
+	// Undo the on-wire MessageId half-swap (see serialize) so MessageID holds
+	// the standard UUID byte order.
+	copy(m.MessageID[0:8], buf[smMessageIDOffset+8:smMessageIDOffset+16])
+	copy(m.MessageID[8:16], buf[smMessageIDOffset:smMessageIDOffset+8])
 
 	payloadLen := int(binary.BigEndian.Uint32(buf[smPayloadLengthOffset:]))
 	end := smPayloadOffset + payloadLen
@@ -442,7 +455,7 @@ func deserializeAgentMessage(buf []byte) (*agentMessage, error) {
 	return m, nil
 }
 
-// ssmDataChannel drives one WebSocket session: open -> handshake -> bridge.
+// ssmDataChannel drives one WebSocket session: open -> handshake -> smux relay.
 type ssmDataChannel struct {
 	ws    *websocket.Conn
 	token string
@@ -453,7 +466,29 @@ type ssmDataChannel struct {
 
 	handshakeDone chan struct{}
 	handshakeOnce sync.Once
+
+	// Agent output payloads (smux frames) are written to pw by readLoop and read
+	// back by the smux session through pr.
+	pr *io.PipeReader
+	pw *io.PipeWriter
 }
+
+// dataChannelRWC adapts the SSM data channel to an io.ReadWriteCloser so an smux
+// client session can run over it. The agent serves the port-forwarding data
+// plane as an smux stream multiplexer, so reads return agent output payloads and
+// writes are sent as input_stream_data.
+type dataChannelRWC struct{ dc *ssmDataChannel }
+
+func (c *dataChannelRWC) Read(p []byte) (int, error) { return c.dc.pr.Read(p) }
+
+func (c *dataChannelRWC) Write(p []byte) (int, error) {
+	if err := c.dc.sendData(p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (c *dataChannelRWC) Close() error { return c.dc.pr.CloseWithError(io.EOF) }
 
 type openDataChannelInput struct {
 	MessageSchemaVersion string `json:"MessageSchemaVersion"`
@@ -499,7 +534,26 @@ func (dc *ssmDataChannel) run(ctx context.Context) {
 		return
 	}
 
-	go dc.writeLoop(errc)
+	// The agent serves the port-forwarding data plane over smux on top of the SSM
+	// data channel, so raw bytes are ignored. Layer an smux client over the
+	// channel, open a stream, and relay the local connection through it.
+	session, err := smux.Client(&dataChannelRWC{dc: dc}, smux.DefaultConfig())
+	if err != nil {
+		log.Printf("[ERROR] ssm tunnel: smux client: %v", err)
+		return
+	}
+	defer func() { _ = session.Close() }()
+
+	stream, err := session.OpenStream()
+	if err != nil {
+		log.Printf("[ERROR] ssm tunnel: smux open stream: %v", err)
+		return
+	}
+	defer func() { _ = stream.Close() }()
+	log.Printf("[DEBUG] ssm tunnel: smux stream %d open, relaying", stream.ID())
+
+	go func() { _, e := io.Copy(stream, dc.local); errc <- e }()
+	go func() { _, e := io.Copy(dc.local, stream); errc <- e }()
 	<-errc
 }
 
@@ -525,7 +579,7 @@ func (dc *ssmDataChannel) readLoop(errc chan error) {
 			case smPayloadTypeHandshakeComplete:
 				dc.handshakeOnce.Do(func() { close(dc.handshakeDone) })
 			case smPayloadTypeOutput:
-				if _, werr := dc.local.Write(msg.Payload); werr != nil {
+				if _, werr := dc.pw.Write(msg.Payload); werr != nil {
 					errc <- werr
 					return
 				}
@@ -544,24 +598,13 @@ func (dc *ssmDataChannel) readLoop(errc chan error) {
 	}
 }
 
-func (dc *ssmDataChannel) writeLoop(errc chan error) {
-	buf := make([]byte, 1024)
-	for {
-		n, err := dc.local.Read(buf)
-		if n > 0 {
-			if werr := dc.sendData(buf[:n]); werr != nil {
-				errc <- werr
-				return
-			}
-		}
-		if err != nil {
-			errc <- err
-			return
-		}
-	}
-}
-
-func (dc *ssmDataChannel) sendData(p []byte) error {
+// nextInput builds the next input_stream_data message on the shared client
+// sequence, with the SYN flag on the first message (sequence 0). The handshake
+// response and all subsequent smux data go through this one sequence: the agent
+// advances its expected sequence as it processes the handshake response, so the
+// smux frames that follow must be contiguous (sequence 1, 2, ...). Reusing
+// sequence 0 makes the agent treat the first frame as a duplicate and drop it.
+func (dc *ssmDataChannel) nextInput(payloadType uint32, p []byte) *agentMessage {
 	flags := uint64(0)
 	if dc.seq == 0 {
 		flags = flagSyn
@@ -573,11 +616,23 @@ func (dc *ssmDataChannel) sendData(p []byte) error {
 		SequenceNumber: dc.seq,
 		Flags:          flags,
 		MessageID:      newUUID(),
-		PayloadType:    smPayloadTypeOutput,
+		PayloadType:    payloadType,
 		Payload:        append([]byte(nil), p...),
 	}
 	dc.seq++
-	return dc.writeAgentMessage(m)
+	return m
+}
+
+// sendInput serializes and sends one input_stream_data message under writeMu so
+// the sequence counter and the websocket write stay consistent.
+func (dc *ssmDataChannel) sendInput(payloadType uint32, p []byte) error {
+	dc.writeMu.Lock()
+	defer dc.writeMu.Unlock()
+	return dc.ws.WriteMessage(websocket.BinaryMessage, dc.nextInput(payloadType, p).serialize())
+}
+
+func (dc *ssmDataChannel) sendData(p []byte) error {
+	return dc.sendInput(smPayloadTypeOutput, p)
 }
 
 type acknowledgeContent struct {
@@ -656,16 +711,10 @@ func (dc *ssmDataChannel) sendHandshakeResponse(reqPayload []byte) {
 		log.Printf("[WARN] ssm tunnel: marshaling handshake response: %v", err)
 		return
 	}
-	m := &agentMessage{
-		MessageType:    smInputStreamData,
-		SchemaVersion:  1,
-		CreatedDate:    nowMillis(),
-		SequenceNumber: 0,
-		MessageID:      newUUID(),
-		PayloadType:    smPayloadTypeHandshakeResponse,
-		Payload:        b,
-	}
-	if err := dc.writeAgentMessage(m); err != nil {
+	// The handshake response is the first client message: sequence 0 with the SYN
+	// flag. It shares the data stream sequence so the smux frames that follow are
+	// contiguous (sequence 1, 2, ...).
+	if err := dc.sendInput(smPayloadTypeHandshakeResponse, b); err != nil {
 		log.Printf("[WARN] ssm tunnel: sending handshake response: %v", err)
 	}
 }
